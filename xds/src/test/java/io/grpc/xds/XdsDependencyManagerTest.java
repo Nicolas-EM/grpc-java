@@ -298,7 +298,7 @@ public class XdsDependencyManagerTest {
         getEndpointConfig(config.getClusters().get(CLUSTER_NAME));
 
     Endpoints.LocalityLbEndpoints locality = endpointConfig.getEndpoint().getValue()
-        .localityLbEndpointsMap.values().iterator().next();
+        .localityLbEndpoints.values().iterator().next();
     assertThat(locality.endpointCollection()).isNull();
     assertThat(locality.lbEndpointCollectionName()).isEqualTo(LEDS_NAME);
 
@@ -373,7 +373,7 @@ public class XdsDependencyManagerTest {
     verify(xdsConfigWatcher).onUpdate(xdsUpdateCaptor.capture());
     XdsClusterConfig.EndpointConfig endpointConfig =
         getEndpointConfig(xdsUpdateCaptor.getValue().getValue().getClusters().get(CLUSTER_NAME));
-    assertThat(endpointConfig.getEndpoint().getValue().localityLbEndpointsMap).hasSize(2);
+    assertThat(endpointConfig.getEndpoint().getValue().localityLbEndpoints).hasSize(2);
     // The collection is stored once and subscribed to once.
     assertThat(endpointConfig.getLbEndpointCollectionResources().keySet())
         .containsExactly(LEDS_NAME);
@@ -840,7 +840,7 @@ public class XdsDependencyManagerTest {
     EdsUpdate edsForB = getEndpoint(initialConfig.getClusters().get("clusterB")).getValue();
     assertThat(edsForB.clusterName).isEqualTo(edsName);
     assertThat(edsForA).isEqualTo(edsForB);
-    edsForA.localityLbEndpointsMap.values().forEach(
+    edsForA.localityLbEndpoints.values().forEach(
         localityLbEndpoints ->
             assertThat(localityLbEndpoints.endpointCollection().endpoints()).hasSize(1));
   }

@@ -683,6 +683,55 @@ public class ClusterResolverLoadBalancerTest {
             createEndpoints(LOCALITY2, 0)));
   }
 
+  @Test
+  @SuppressWarnings("unchecked")
+  public void edsUpdatePriorityName_sameLocalityAtTwoPriorities_namesAreStable() {
+    List<LocalityLbEndpoints> update = Arrays.asList(
+        createEndpoints(LOCALITY1, 0, "127.0.0.1"),
+        createEndpoints(LOCALITY1, 1, "127.0.0.2"));
+    verifyEdsPriorityNames(Arrays.asList(CLUSTER + "[child1]", CLUSTER + "[child2]"),
+        update, update);
+  }
+
+  @Test
+  public void handleEdsResource_sameLocalityAtTwoPriorities_keepsEndpointsOfEachPriority() {
+    ClusterLoadAssignment clusterLoadAssignment = ClusterLoadAssignment.newBuilder()
+        .setClusterName(EDS_SERVICE_NAME)
+        .addEndpoints(createEndpoints(LOCALITY1, 0, "127.0.0.1"))
+        .addEndpoints(createEndpoints(LOCALITY1, 1, "127.0.0.2"))
+        .build();
+    controlPlaneService.setXdsConfig(ADS_TYPE_URL_EDS, ImmutableMap.of(
+        EDS_SERVICE_NAME, clusterLoadAssignment));
+    startXdsDepManager();
+
+    verify(helper, never()).updateBalancingState(eq(ConnectivityState.TRANSIENT_FAILURE), any());
+    FakeLoadBalancer childBalancer = Iterables.getOnlyElement(childBalancers);
+    String priority1 = CLUSTER + "[child1]";
+    String priority2 = CLUSTER + "[child2]";
+    assertThat(((PriorityLbConfig) childBalancer.config).priorities)
+        .containsExactly(priority1, priority2).inOrder();
+    assertAddressesEqual(
+        Arrays.asList(
+            newInetSocketAddressEag("127.0.0.1", 8080),
+            newInetSocketAddressEag("127.0.0.2", 8080)),
+        childBalancer.addresses);
+    assertAddressesEqual(
+        Arrays.asList(newInetSocketAddressEag("127.0.0.1", 8080)),
+        AddressFilter.filter(childBalancer.addresses, priority1));
+    assertAddressesEqual(
+        Arrays.asList(newInetSocketAddressEag("127.0.0.2", 8080)),
+        AddressFilter.filter(childBalancer.addresses, priority2));
+  }
+
+  private LocalityLbEndpoints createEndpoints(Locality locality, int priority, String address) {
+    return LocalityLbEndpoints.newBuilder()
+        .setLoadBalancingWeight(UInt32Value.of(70))
+        .setLocality(locality)
+        .setPriority(priority)
+        .addLbEndpoints(newSocketLbEndpoint(address, 8080))
+        .build();
+  }
+
   private LocalityLbEndpoints createEndpoints(Locality locality, int priority) {
     // Localities must have distinct endpoint addresses even when their priorities are merged.
     String address = ImmutableMap.of(

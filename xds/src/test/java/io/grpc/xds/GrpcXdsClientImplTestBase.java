@@ -622,7 +622,7 @@ public abstract class GrpcXdsClientImplTestBase {
         .containsExactly(
             DropOverload.create("lb", 200),
             DropOverload.create("throttle", 1000));
-    assertThat(edsUpdate.localityLbEndpointsMap)
+    assertThat(edsUpdate.localityLbEndpoints)
         .containsExactly(
             Locality.create("region1", "zone1", "subzone1"),
             LocalityLbEndpoints.create(
@@ -4059,7 +4059,7 @@ public abstract class GrpcXdsClientImplTestBase {
     edsUpdate = statusOrUpdate.getValue();
     assertThat(edsUpdate.clusterName).isEqualTo(EDS_RESOURCE);
     assertThat(edsUpdate.dropPolicies).isEmpty();
-    assertThat(edsUpdate.localityLbEndpointsMap)
+    assertThat(edsUpdate.localityLbEndpoints)
         .containsExactly(
             Locality.create("region2", "zone2", "subzone2"),
             LocalityLbEndpoints.create(
@@ -4070,6 +4070,57 @@ public abstract class GrpcXdsClientImplTestBase {
     verifyResourceMetadataAcked(EDS, EDS_RESOURCE, updatedClusterLoadAssignment, VERSION_2,
         TIME_INCREMENT * 2);
     verifySubscribedResourcesMetadataSizes(0, 0, 0, 1);
+  }
+
+  @Test
+  public void edsSameLocalityAtMultiplePriorities_keepsAllPriorities() {
+    DiscoveryRpcCall call = startResourceWatcher(XdsEndpointResource.getInstance(), EDS_RESOURCE,
+        edsResourceWatcher);
+    Any clusterLoadAssignment = Any.pack(mf.buildClusterLoadAssignment(EDS_RESOURCE,
+        ImmutableList.of(
+            mf.buildLocalityLbEndpoints("region1", "zone1", "subzone1",
+                mf.buildLbEndpoint("172.44.1.1", 8000, "healthy", 1, "host1"), 1, 0),
+            mf.buildLocalityLbEndpoints("region1", "zone1", "subzone1",
+                mf.buildLbEndpoint("172.44.1.2", 8000, "healthy", 1, "host2"), 1, 1)),
+        ImmutableList.of()));
+    call.sendResponse(EDS, clusterLoadAssignment, VERSION_1, "0000");
+
+    call.verifyRequest(EDS, EDS_RESOURCE, VERSION_1, "0000", NODE);
+    verify(edsResourceWatcher).onResourceChanged(edsUpdateCaptor.capture());
+    EdsUpdate edsUpdate = edsUpdateCaptor.getValue().getValue();
+    Locality locality = Locality.create("region1", "zone1", "subzone1");
+    assertThat(edsUpdate.localityLbEndpoints)
+        .containsExactly(
+            locality,
+            LocalityLbEndpoints.create(
+                ImmutableList.of(
+                    LbEndpoint.create("172.44.1.1", 8000, 1, true, "host1", ImmutableMap.of())),
+                1, 0, ImmutableMap.of()),
+            locality,
+            LocalityLbEndpoints.create(
+                ImmutableList.of(
+                    LbEndpoint.create("172.44.1.2", 8000, 1, true, "host2", ImmutableMap.of())),
+                1, 1, ImmutableMap.of()))
+        .inOrder();
+  }
+
+  @Test
+  public void edsDuplicateLocalityAtSamePriority_nacked() {
+    DiscoveryRpcCall call = startResourceWatcher(XdsEndpointResource.getInstance(), EDS_RESOURCE,
+        edsResourceWatcher);
+    Any clusterLoadAssignment = Any.pack(mf.buildClusterLoadAssignment(EDS_RESOURCE,
+        ImmutableList.of(
+            mf.buildLocalityLbEndpoints("region1", "zone1", "subzone1",
+                mf.buildLbEndpoint("172.44.1.1", 8000, "healthy", 1, "host1"), 1, 0),
+            mf.buildLocalityLbEndpoints("region1", "zone1", "subzone1",
+                mf.buildLbEndpoint("172.44.1.2", 8000, "healthy", 1, "host2"), 1, 0)),
+        ImmutableList.of()));
+    call.sendResponse(EDS, clusterLoadAssignment, VERSION_1, "0000");
+
+    List<String> errors = ImmutableList.of("EDS response ClusterLoadAssignment '" + EDS_RESOURCE
+        + "' validation error: ClusterLoadAssignment has duplicate locality:"
+        + Locality.create("region1", "zone1", "subzone1") + " for priority:0");
+    call.verifyRequestNack(EDS, EDS_RESOURCE, "", "0000", NODE, errors);
   }
 
   @Test
@@ -4263,7 +4314,7 @@ public abstract class GrpcXdsClientImplTestBase {
     call.sendResponse(EDS, assignment, VERSION_1, "0000");
     call.verifyRequest(EDS, EDS_RESOURCE, VERSION_1, "0000", NODE);
     verify(edsResourceWatcher).onResourceChanged(edsUpdateCaptor.capture());
-    assertThat(edsUpdateCaptor.getValue().getValue().localityLbEndpointsMap).hasSize(2);
+    assertThat(edsUpdateCaptor.getValue().getValue().localityLbEndpoints).hasSize(2);
   }
 
   @Test
@@ -4278,7 +4329,7 @@ public abstract class GrpcXdsClientImplTestBase {
     call.sendResponse(EDS, assignment, VERSION_1, "0000");
     call.verifyRequest(EDS, EDS_RESOURCE, VERSION_1, "0000", NODE);
     verify(edsResourceWatcher).onResourceChanged(edsUpdateCaptor.capture());
-    assertThat(edsUpdateCaptor.getValue().getValue().localityLbEndpointsMap).hasSize(1);
+    assertThat(edsUpdateCaptor.getValue().getValue().localityLbEndpoints).hasSize(1);
   }
 
   @Test
@@ -4454,7 +4505,7 @@ public abstract class GrpcXdsClientImplTestBase {
     edsUpdate = statusOrUpdate.getValue();
     assertThat(edsUpdate.clusterName).isEqualTo(edsResourceTwo);
     assertThat(edsUpdate.dropPolicies).isEmpty();
-    assertThat(edsUpdate.localityLbEndpointsMap)
+    assertThat(edsUpdate.localityLbEndpoints)
         .containsExactly(
             Locality.create("region2", "zone2", "subzone2"),
             LocalityLbEndpoints.create(
@@ -4468,7 +4519,7 @@ public abstract class GrpcXdsClientImplTestBase {
     edsUpdate = statusOrUpdate.getValue();
     assertThat(edsUpdate.clusterName).isEqualTo(edsResourceTwo);
     assertThat(edsUpdate.dropPolicies).isEmpty();
-    assertThat(edsUpdate.localityLbEndpointsMap)
+    assertThat(edsUpdate.localityLbEndpoints)
         .containsExactly(
             Locality.create("region2", "zone2", "subzone2"),
             LocalityLbEndpoints.create(
