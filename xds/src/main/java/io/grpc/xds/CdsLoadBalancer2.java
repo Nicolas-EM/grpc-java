@@ -22,8 +22,11 @@ import static io.grpc.ConnectivityState.TRANSIENT_FAILURE;
 import static io.grpc.xds.XdsLbPolicies.CDS_POLICY_NAME;
 import static io.grpc.xds.XdsLbPolicies.PRIORITY_POLICY_NAME;
 
+import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ListMultimap;
 import com.google.common.primitives.UnsignedInts;
 import com.google.errorprone.annotations.CheckReturnValue;
 import io.grpc.Attributes;
@@ -70,10 +73,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import javax.annotation.Nullable;
 
 /**
  * Load balancer for cds_experimental LB policy. One instance per top-level cluster.
@@ -327,7 +332,9 @@ final class CdsLoadBalancer2 extends LoadBalancer {
   }
 
   private final class ClusterState {
-    private Map<Locality, String> localityPriorityNames = Collections.emptyMap();
+    // Priority names used in the previous update, for each locality. A locality has one name for
+    // each priority it appeared under, ordered from the highest to the lowest priority.
+    private ListMultimap<Locality, String> localityPriorityNames = ImmutableListMultimap.of();
     int priorityNameGenId = 1;
 
     StatusOr<ClusterResolutionResult> edsUpdateToResult(
@@ -347,22 +354,22 @@ final class CdsLoadBalancer2 extends LoadBalancer {
       logger.log(XdsLogLevel.DEBUG, "Received endpoint update {0}", update);
       if (logger.isLoggable(XdsLogLevel.INFO)) {
         logger.log(XdsLogLevel.INFO, "Cluster {0}: {1} localities, {2} drop categories",
-            clusterName, update.localityLbEndpointsMap.size(),
+            clusterName, update.localityLbEndpoints.size(),
             update.dropPolicies.size());
       }
-      Map<Locality, LocalityLbEndpoints> localityLbEndpoints =
-          update.localityLbEndpointsMap;
+      ListMultimap<Locality, LocalityLbEndpoints> localityLbEndpoints =
+          update.localityLbEndpoints;
       List<DropOverload> dropOverloads = update.dropPolicies;
       List<EquivalentAddressGroup> addresses = new ArrayList<>();
       Map<String, Map<Locality, Integer>> prioritizedLocalityWeights = new HashMap<>();
-      List<String> sortedPriorityNames =
+      Map<Integer, String> priorityNames =
           generatePriorityNames(clusterName, localityLbEndpoints);
+      List<String> sortedPriorityNames = new ArrayList<>(priorityNames.values());
       Map<String, Long> priorityLocalityWeightSums;
       if (pickFirstWeightedShuffling) {
         priorityLocalityWeightSums = new HashMap<>(sortedPriorityNames.size() * 2);
-        for (Locality locality : localityLbEndpoints.keySet()) {
-          LocalityLbEndpoints localityLbInfo = localityLbEndpoints.get(locality);
-          String priorityName = localityPriorityNames.get(locality);
+        for (LocalityLbEndpoints localityLbInfo : localityLbEndpoints.values()) {
+          String priorityName = priorityNames.get(localityLbInfo.priority());
           Long sum = priorityLocalityWeightSums.get(priorityName);
           if (sum == null) {
             sum = 0L;
@@ -374,10 +381,11 @@ final class CdsLoadBalancer2 extends LoadBalancer {
         priorityLocalityWeightSums = null;
       }
 
-      for (Locality locality : localityLbEndpoints.keySet()) {
-        LocalityLbEndpoints localityLbInfo = localityLbEndpoints.get(locality);
+      for (Map.Entry<Locality, LocalityLbEndpoints> entry : localityLbEndpoints.entries()) {
+        Locality locality = entry.getKey();
+        LocalityLbEndpoints localityLbInfo = entry.getValue();
         List<LbEndpoint> localityEndpoints = resolveEndpoints(localityLbInfo, endpointConfig);
-        String priorityName = localityPriorityNames.get(locality);
+        String priorityName = priorityNames.get(localityLbInfo.priority());
         String localityName = localityName(locality);
         AddressFilter.PathChain pathChain =
             AddressFilter.createPathChain(Arrays.asList(priorityName, localityName));
@@ -524,38 +532,53 @@ final class CdsLoadBalancer2 extends LoadBalancer {
           .build();
     }
 
-    private List<String> generatePriorityNames(String name,
-        Map<Locality, LocalityLbEndpoints> localityLbEndpoints) {
+    /**
+     * Returns the name of each priority, ordered from the highest to the lowest priority. Reuses
+     * the names of the previous update where possible, so that the child policies of a priority
+     * keep their state when the priorities change.
+     */
+    private Map<Integer, String> generatePriorityNames(String name,
+        ListMultimap<Locality, LocalityLbEndpoints> localityLbEndpoints) {
       TreeMap<Integer, List<Locality>> todo = new TreeMap<>();
-      for (Locality locality : localityLbEndpoints.keySet()) {
-        int priority = localityLbEndpoints.get(locality).priority();
+      for (Map.Entry<Locality, LocalityLbEndpoints> entry : localityLbEndpoints.entries()) {
+        int priority = entry.getValue().priority();
         if (!todo.containsKey(priority)) {
           todo.put(priority, new ArrayList<>());
         }
-        todo.get(priority).add(locality);
+        todo.get(priority).add(entry.getKey());
       }
-      Map<Locality, String> newNames = new HashMap<>();
+      ListMultimap<Locality, String> newNames = ArrayListMultimap.create();
       Set<String> usedNames = new HashSet<>();
-      List<String> ret = new ArrayList<>();
-      for (Integer priority: todo.keySet()) {
-        String foundName = "";
-        for (Locality locality : todo.get(priority)) {
-          if (localityPriorityNames.containsKey(locality)
-              && usedNames.add(localityPriorityNames.get(locality))) {
-            foundName = localityPriorityNames.get(locality);
-            break;
-          }
-        }
-        if ("".equals(foundName)) {
+      Map<Integer, String> ret = new LinkedHashMap<>();
+      for (Map.Entry<Integer, List<Locality>> priority : todo.entrySet()) {
+        String foundName = findUnusedPriorityName(priority.getValue(), usedNames);
+        if (foundName == null) {
           foundName = priorityName(name, priorityNameGenId++);
         }
-        for (Locality locality : todo.get(priority)) {
+        for (Locality locality : priority.getValue()) {
           newNames.put(locality, foundName);
         }
-        ret.add(foundName);
+        ret.put(priority.getKey(), foundName);
       }
       localityPriorityNames = newNames;
       return ret;
+    }
+
+    /**
+     * Returns the first name that one of the localities had in the previous update and that is not
+     * in {@code usedNames} yet, and adds it to {@code usedNames}. Returns {@code null} if there is
+     * no such name.
+     */
+    @Nullable
+    private String findUnusedPriorityName(List<Locality> localities, Set<String> usedNames) {
+      for (Locality locality : localities) {
+        for (String candidate : localityPriorityNames.get(locality)) {
+          if (usedNames.add(candidate)) {
+            return candidate;
+          }
+        }
+      }
+      return null;
     }
   }
 

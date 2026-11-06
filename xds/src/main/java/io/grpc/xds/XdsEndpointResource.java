@@ -20,7 +20,9 @@ import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ListMultimap;
 import com.google.common.net.InetAddresses;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -48,7 +50,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -122,7 +123,8 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
   private static EdsUpdate processClusterLoadAssignment(ClusterLoadAssignment assignment)
       throws ResourceInvalidException {
     Map<Integer, Set<Locality>> priorities = new HashMap<>();
-    Map<Locality, LocalityLbEndpoints> localityLbEndpointsMap = new LinkedHashMap<>();
+    ImmutableListMultimap.Builder<Locality, LocalityLbEndpoints> localityLbEndpoints =
+        ImmutableListMultimap.builder();
     Set<java.net.SocketAddress> endpointAddresses = new HashSet<>();
     List<Endpoints.DropOverload> dropOverloads = new ArrayList<>();
     int maxPriority = -1;
@@ -137,14 +139,14 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
         throw new ResourceInvalidException(structOrError.getErrorDetail());
       }
 
-      LocalityLbEndpoints localityLbEndpoints = structOrError.getStruct();
-      int priority = localityLbEndpoints.priority();
+      LocalityLbEndpoints localityLbEndpointsStruct = structOrError.getStruct();
+      int priority = localityLbEndpointsStruct.priority();
       maxPriority = Math.max(maxPriority, priority);
       // Note endpoints with health status other than HEALTHY and UNKNOWN are still
       // handed over to watching parties. It is watching parties' responsibility to
       // filter out unhealthy endpoints. See EnvoyProtoData.LbEndpoint#isHealthy().
       Locality locality =  parseLocality(localityLbEndpointsProto.getLocality());
-      localityLbEndpointsMap.put(locality, localityLbEndpoints);
+      // A locality may appear under multiple priorities (gRFC A52), but at most once per priority.
       if (!priorities.containsKey(priority)) {
         priorities.put(priority, new HashSet<>());
       }
@@ -152,11 +154,18 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
         throw new ResourceInvalidException("ClusterLoadAssignment has duplicate locality:"
             + locality + " for priority:" + priority);
       }
-      for (Endpoints.LbEndpoint endpoint : localityLbEndpoints.endpoints()) {
-        for (java.net.SocketAddress address : endpoint.eag().getAddresses()) {
-          if (!endpointAddresses.add(address)) {
-            throw new ResourceInvalidException(
-                "ClusterLoadAssignment has duplicate endpoint address: " + address);
+      localityLbEndpoints.put(locality, localityLbEndpointsStruct);
+      // Endpoints of a LEDS collection (gRFC A95) are not known yet, so only inlined endpoints
+      // are checked here.
+      Endpoints.LbEndpointCollection endpointCollection =
+          localityLbEndpointsStruct.endpointCollection();
+      if (endpointCollection != null) {
+        for (Endpoints.LbEndpoint endpoint : endpointCollection.endpoints()) {
+          for (java.net.SocketAddress address : endpoint.eag().getAddresses()) {
+            if (!endpointAddresses.add(address)) {
+              throw new ResourceInvalidException(
+                  "ClusterLoadAssignment has duplicate endpoint address: " + address);
+            }
           }
         }
       }
@@ -169,7 +178,8 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
         : assignment.getPolicy().getDropOverloadsList()) {
       dropOverloads.add(parseDropOverload(dropOverloadProto));
     }
-    return new EdsUpdate(assignment.getClusterName(), localityLbEndpointsMap, dropOverloads);
+    return new EdsUpdate(
+        assignment.getClusterName(), localityLbEndpoints.build(), dropOverloads);
   }
 
   private static Locality parseLocality(io.envoyproxy.envoy.config.core.v3.Locality proto) {
@@ -310,14 +320,27 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
 
   static final class EdsUpdate implements ResourceUpdate {
     final String clusterName;
-    final Map<Locality, LocalityLbEndpoints> localityLbEndpointsMap;
+    /**
+     * Endpoints of each locality. A locality can have one entry for each priority it appears under
+     * (gRFC A52), so use {@link LocalityLbEndpoints#priority()} to tell the entries of a locality
+     * apart.
+     */
+    final ImmutableListMultimap<Locality, LocalityLbEndpoints> localityLbEndpoints;
     final List<DropOverload> dropPolicies;
 
     EdsUpdate(String clusterName, Map<Locality, LocalityLbEndpoints> localityLbEndpoints,
               List<DropOverload> dropPolicies) {
+      this(clusterName,
+          ImmutableListMultimap.copyOf(
+              checkNotNull(localityLbEndpoints, "localityLbEndpoints").entrySet()),
+          dropPolicies);
+    }
+
+    EdsUpdate(String clusterName, ListMultimap<Locality, LocalityLbEndpoints> localityLbEndpoints,
+              List<DropOverload> dropPolicies) {
       this.clusterName = checkNotNull(clusterName, "clusterName");
-      this.localityLbEndpointsMap = Collections.unmodifiableMap(
-          new LinkedHashMap<>(checkNotNull(localityLbEndpoints, "localityLbEndpoints")));
+      this.localityLbEndpoints = ImmutableListMultimap.copyOf(
+          checkNotNull(localityLbEndpoints, "localityLbEndpoints"));
       this.dropPolicies = Collections.unmodifiableList(
           new ArrayList<>(checkNotNull(dropPolicies, "dropPolicies")));
     }
@@ -332,13 +355,13 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
       }
       EdsUpdate that = (EdsUpdate) o;
       return Objects.equals(clusterName, that.clusterName)
-          && Objects.equals(localityLbEndpointsMap, that.localityLbEndpointsMap)
+          && Objects.equals(localityLbEndpoints, that.localityLbEndpoints)
           && Objects.equals(dropPolicies, that.dropPolicies);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(clusterName, localityLbEndpointsMap, dropPolicies);
+      return Objects.hash(clusterName, localityLbEndpoints, dropPolicies);
     }
 
     @Override
@@ -347,7 +370,7 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
           MoreObjects
               .toStringHelper(this)
               .add("clusterName", clusterName)
-              .add("localityLbEndpointsMap", localityLbEndpointsMap)
+              .add("localityLbEndpoints", localityLbEndpoints)
               .add("dropPolicies", dropPolicies)
               .toString();
     }

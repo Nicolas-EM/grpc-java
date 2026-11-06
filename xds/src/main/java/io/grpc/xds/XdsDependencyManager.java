@@ -407,7 +407,7 @@ final class XdsDependencyManager implements XdsConfig.XdsClusterSubscriptionRegi
     }
     Map<String, StatusOr<LbEndpointCollectionUpdate>> collections = new HashMap<>();
     for (LocalityLbEndpoints locality
-        : edsUpdateOr.getValue().localityLbEndpointsMap.values()) {
+        : edsUpdateOr.getValue().localityLbEndpoints.values()) {
       String collectionName = locality.lbEndpointCollectionName();
       if (collectionName == null || collections.containsKey(collectionName)) {
         continue;
@@ -888,7 +888,7 @@ final class XdsDependencyManager implements XdsConfig.XdsClusterSubscriptionRegi
 
     @Override
     public void subscribeToChildren(XdsEndpointResource.EdsUpdate update) {
-      for (LocalityLbEndpoints localityLbEndpoints : update.localityLbEndpointsMap.values()) {
+      for (LocalityLbEndpoints localityLbEndpoints : update.localityLbEndpoints.values()) {
         String collectionName = localityLbEndpoints.lbEndpointCollectionName();
         if (collectionName != null) {
           addLedsWatcher(collectionName);
