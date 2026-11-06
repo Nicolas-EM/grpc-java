@@ -152,11 +152,17 @@ class XdsEndpointResource extends XdsResourceType<EdsUpdate> {
         throw new ResourceInvalidException("ClusterLoadAssignment has duplicate locality:"
             + locality + " for priority:" + priority);
       }
-      for (Endpoints.LbEndpoint endpoint : localityLbEndpoints.endpoints()) {
-        for (java.net.SocketAddress address : endpoint.eag().getAddresses()) {
-          if (!endpointAddresses.add(address)) {
-            throw new ResourceInvalidException(
-                "ClusterLoadAssignment has duplicate endpoint address: " + address);
+      // Endpoints of a LEDS collection (gRFC A95) are not known yet, so only inlined endpoints
+      // are checked here.
+      Endpoints.LbEndpointCollection endpointCollection =
+          localityLbEndpoints.endpointCollection();
+      if (endpointCollection != null) {
+        for (Endpoints.LbEndpoint endpoint : endpointCollection.endpoints()) {
+          for (java.net.SocketAddress address : endpoint.eag().getAddresses()) {
+            if (!endpointAddresses.add(address)) {
+              throw new ResourceInvalidException(
+                  "ClusterLoadAssignment has duplicate endpoint address: " + address);
+            }
           }
         }
       }
